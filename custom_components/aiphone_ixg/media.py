@@ -29,8 +29,10 @@ from ._deps import ensure_runtime_deps
 ensure_runtime_deps()
 
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+from aiortc.codecs import CODECS
 from aiortc.contrib.media import MediaRecorder
 from aiortc.mediastreams import MediaStreamTrack
+from aiortc.rtcrtpparameters import RTCRtcpFeedback, RTCRtpCodecParameters
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import (
@@ -79,6 +81,131 @@ def _log_audio_section(tag: str, sdp: str) -> None:
                                        "a=mid:", "c=")):
             lines.append(ln)
     _LOGGER.info("%s audio block:\n  %s", tag, "\n  ".join(lines) if lines else "(none)")
+
+
+# aiortc barely advertises H.264: constrained baseline (42001f / 42e01f) with
+# packetization-mode=1 only.  IXG offers H.264 with whatever profile the
+# gateway/entrance station is configured for (often Main/High or
+# packetization-mode=0), which makes aiortc raise
+# "Failed to set remote video description send parameters" before we can even
+# answer.  PyAV (aiortc's decoder) handles every H.264 profile, so register the
+# offered profile with aiortc instead of refusing the stream.
+_H264_LOCAL_PT = 127
+_H264_DEFAULT_PROFILE = "42e01f"
+_KNOWN_H264: set[tuple[str, str]] = {("42001f", "1"), ("42e01f", "1")}
+
+
+def _sdp_media_block(sdp: str, kind: str) -> list[str]:
+    """Return the lines of the first ``m=<kind>`` section of an SDP."""
+    block: list[str] = []
+    inside = False
+    for line in sdp.splitlines():
+        if line.startswith("m="):
+            if inside:
+                break
+            inside = line.startswith(f"m={kind} ")
+            block = [line] if inside else []
+        elif inside:
+            block.append(line)
+    return block
+
+
+def _sdp_rtpmaps(sdp: str, kind: str) -> dict[int, tuple[str, int]]:
+    codecs: dict[int, tuple[str, int]] = {}
+    for line in _sdp_media_block(sdp, kind):
+        m = re.match(r"a=rtpmap:(\d+)\s+([^/\s]+)/(\d+)", line)
+        if m:
+            codecs[int(m.group(1))] = (m.group(2), int(m.group(3)))
+    return codecs
+
+
+def _sdp_fmtps(sdp: str, kind: str) -> dict[int, dict[str, str]]:
+    out: dict[int, dict[str, str]] = {}
+    for line in _sdp_media_block(sdp, kind):
+        m = re.match(r"a=fmtp:(\d+)\s+(.*)", line)
+        if not m:
+            continue
+        params: dict[str, str] = {}
+        for part in m.group(2).split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            key, _, value = part.partition("=")
+            params[key.strip()] = value.strip()
+        out[int(m.group(1))] = params
+    return out
+
+
+def _log_video_section(tag: str, sdp: str) -> None:
+    """Print the m=video block + its codec/direction lines (diagnostics)."""
+    wanted = (
+        "m=",
+        "a=rtpmap:",
+        "a=fmtp:",
+        "a=sendrecv",
+        "a=sendonly",
+        "a=recvonly",
+        "a=inactive",
+        "a=mid:",
+        "c=",
+    )
+    lines = [ln for ln in _sdp_media_block(sdp, "video") if ln.startswith(wanted)]
+    _LOGGER.info("%s video block:\n  %s", tag, "\n  ".join(lines) if lines else "(none)")
+
+
+def _prepare_offer_video(tag: str, sdp: str) -> bool:
+    """Make aiortc able to negotiate the video codecs in a cloud offer.
+
+    Returns False when the offer carries a video section but none of its
+    codecs can be decoded by aiortc.
+    """
+    _log_video_section(tag, sdp)
+    if not _sdp_media_block(sdp, "video"):
+        return True
+
+    rtpmaps = _sdp_rtpmaps(sdp, "video")
+    if not rtpmaps:
+        _LOGGER.warning("%s: video section has no rtpmap", tag)
+        return False
+
+    fmtps = _sdp_fmtps(sdp, "video")
+    decodable = False
+    for pt, (name, clock_rate) in rtpmaps.items():
+        upper = name.upper()
+        if upper == "H264":
+            decodable = True
+            params = dict(fmtps.get(pt) or {})
+            profile = params.get("profile-level-id", _H264_DEFAULT_PROFILE).lower()
+            packetization = str(params.get("packetization-mode", "0"))
+            key = (profile, packetization)
+            if key in _KNOWN_H264:
+                continue
+            _KNOWN_H264.add(key)
+            CODECS["video"].append(
+                RTCRtpCodecParameters(
+                    mimeType="video/H264",
+                    clockRate=clock_rate or 90000,
+                    payloadType=_H264_LOCAL_PT,
+                    parameters=params,
+                    rtcpFeedback=[
+                        RTCRtcpFeedback(type="nack"),
+                        RTCRtcpFeedback(type="nack", parameter="pli"),
+                        RTCRtcpFeedback(type="goog-remb"),
+                    ],
+                )
+            )
+            _LOGGER.info(
+                "%s: accepted offered H.264 profile-level-id=%s packetization-mode=%s",
+                tag,
+                profile,
+                packetization,
+            )
+        elif upper == "VP8":
+            decodable = True
+        elif upper != "RTX":
+            _LOGGER.warning("%s: cloud offers unsupported video codec %s", tag, name)
+
+    return decodable
 
 
 class _PassthroughVideoTrack(MediaStreamTrack):
@@ -175,6 +302,7 @@ class VideoCapture:
         self._passive_path: Path | None = None
         self._passive_cid: str | None = None
         self._passive_offer_fut: asyncio.Future | None = None
+        self._passive_stop: asyncio.Event | None = None
 
         # active (monitor)
         self._mon_pc1: RTCPeerConnection | None = None
@@ -182,6 +310,7 @@ class VideoCapture:
         self._mon_recorder: MediaRecorder | None = None
         self._mon_path: Path | None = None
         self._mon_cid: str | None = None
+        self._mon_task: asyncio.Task | None = None
         self._mon_fut_31001: asyncio.Future | None = None
         self._mon_fut_24021: asyncio.Future | None = None
         self._mon_fut_31011: asyncio.Future | None = None
@@ -236,8 +365,20 @@ class VideoCapture:
     # PASSIVE — triggered by MID 23001 (doorbell ring)
     # ------------------------------------------------------------------
     async def passive_capture(self, cid: str, dsp1: str, source_cliid: str | None = None) -> None:
-        if not await self._lock.acquire():
-            return
+        if self._passive_pc is not None:
+            if self._passive_cid == cid:
+                _LOGGER.info("passive capture already running for this ring; ignoring duplicate")
+                return
+            _LOGGER.info("passive: new ring while the previous capture is finishing; stopping it")
+            stop = self._passive_stop
+            if stop is not None:
+                stop.set()
+        # A monitor session is lower priority than an actual doorbell ring:
+        # cancel it and take the single video slot instead of skipping the ring.
+        if self._lock.locked():
+            _LOGGER.info("passive: pre-empting active monitor capture for incoming ring")
+            await self.cancel_monitor()
+        await self._lock.acquire()
         try:
             await self._passive_run(cid, dsp1, source_cliid)
         except asyncio.CancelledError:
@@ -255,6 +396,7 @@ class VideoCapture:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         self._passive_path = self.recordings_dir / f"{ts}-{_filename_safe(dsp1 or 'ring')}.mp4"
         self._passive_cid = cid
+        self._passive_stop = asyncio.Event()
         passive_t0 = time.time()  # [Phase 1] timeline anchor for audio diagnostics
         _LOGGER.info("🎥 passive capture cid=%s dsp1=%s -> %s", cid[-30:], dsp1, self._passive_path)
 
@@ -317,6 +459,12 @@ class VideoCapture:
             _LOGGER.error("31011 missing SDP body")
             return
         _log_audio_section("passive janus offer", offer_sdp)
+        if not _prepare_offer_video("passive janus offer", offer_sdp):
+            _LOGGER.error(
+                "passive: no video codec in the cloud offer can be decoded by aiortc; "
+                "not subscribing"
+            )
+            return
 
         # Step 3: setRemoteDescription with actpass→active munge, createAnswer
         offer_munged = offer_sdp.replace("a=setup:actpass", "a=setup:active")
@@ -351,12 +499,14 @@ class VideoCapture:
             _periodic_stats_logger(pc, "passive", period_s=3.0, duration_s=120.0)
         )
 
-        # Hold; coordinator's 24002 handler will call stop()
+        # Hold; coordinator's 24002 handler sets _passive_stop and we tear down.
         try:
-            # Cap at RING_TIMEOUT_S * 2 in case 24002 never arrives
-            await asyncio.sleep(120)
-        except asyncio.CancelledError:
-            pass
+            stop = self._passive_stop
+            if stop is not None:
+                # Cap at two minutes in case 24002 never arrives.
+                await asyncio.wait_for(stop.wait(), timeout=120)
+        except TimeoutError:
+            _LOGGER.info("passive: hold cap reached (no 24002); stopping")
         finally:
             stats_task.cancel()
 
@@ -364,14 +514,18 @@ class VideoCapture:
         """Called from coordinator on 24002 — wait briefly then stop."""
         if self._passive_pc is None:
             return
-        await asyncio.sleep(delay_s)
-        await self._passive_teardown()
+        if delay_s:
+            await asyncio.sleep(delay_s)
+        stop = self._passive_stop
+        if stop is not None:
+            stop.set()
 
     async def _passive_teardown(self) -> None:
         rec, pc, path = self._passive_recorder, self._passive_pc, self._passive_path
         self._passive_pc = self._passive_recorder = None
         self._passive_path = self._passive_cid = None
         self._passive_offer_fut = None
+        self._passive_stop = None
         if rec is not None:
             try:
                 await rec.stop()
@@ -390,9 +544,29 @@ class VideoCapture:
     # ------------------------------------------------------------------
     # ACTIVE — monitor button press
     # ------------------------------------------------------------------
+    def start_monitor(self, duration_s: int = MONITOR_DEFAULT_DURATION_S) -> None:
+        """Start a monitor session in the background (single instance)."""
+        if self._mon_task is not None and not self._mon_task.done():
+            _LOGGER.info("monitor: a capture is already running")
+            return
+        self._mon_task = self.coord.hass.async_create_task(
+            self.monitor_capture(duration_s)
+        )
+
+    async def cancel_monitor(self) -> None:
+        """Cancel an in-flight monitor session and wait for its teardown."""
+        task = self._mon_task
+        self._mon_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     async def monitor_capture(self, duration_s: int = MONITOR_DEFAULT_DURATION_S) -> None:
         if self._lock.locked():
-            _LOGGER.warning("monitor: another capture in progress, skipping")
+            _LOGGER.info("monitor: another capture (ring) is in progress; skipping")
             return
         async with self._lock:
             try:
@@ -414,7 +588,10 @@ class VideoCapture:
         while pc1.iceGatheringState != "complete" and time.time() < end:
             await asyncio.sleep(0.1)
         sdp_offer1 = pc1.localDescription.sdp
-        cid = self.coord.cliid + now_sid()
+        # IXG call IDs look like "<PROPID>-<CLIID>-<SID>" (see 23001/24000);
+        # the plain "<CLIID><SID>" form used by the older WP-2MED cloud is not
+        # routable here, which left 30001/30011 unanswered.
+        cid = f"{self.coord.property_id}-{self.coord.cliid}-{now_sid()}"
         self._mon_cid = cid
         self._mon_pc1 = pc1
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -450,7 +627,18 @@ class VideoCapture:
             "CLIID": self.coord.cliid, "RCVTPC": self.coord.rcvtpc, "RLS": "0",
             "RSLT": 0, "LEN": len(sdp_offer1), "SID": now_sid(), "CID": cid,
         }, "BODY": {"SDP": sdp_offer1}})
-        sdp_a1 = await asyncio.wait_for(self._mon_fut_31001, timeout=8)
+        try:
+            sdp_a1 = await asyncio.wait_for(self._mon_fut_31001, timeout=10)
+        except TimeoutError:
+            _LOGGER.error(
+                "monitor: 31001 publisher answer timeout for cid=%s — the cloud "
+                "did not accept MID 30001",
+                cid[-30:],
+            )
+            return
+        if not sdp_a1:
+            _LOGGER.error("monitor: 31001 had no SDP body")
+            return
         await pc1.setRemoteDescription(RTCSessionDescription(sdp_a1, "answer"))
 
         # Step 2: 23021 MNT_REQ
@@ -464,7 +652,15 @@ class VideoCapture:
             "REASON": 0, "TMKIND": 5, "TMID": 1281,
             "RSLT": 0, "LEN": 0, "SID": now_sid(),
         }})
-        rslt = await asyncio.wait_for(self._mon_fut_24021, timeout=8)
+        try:
+            rslt = await asyncio.wait_for(self._mon_fut_24021, timeout=10)
+        except TimeoutError:
+            _LOGGER.error(
+                "monitor: 24021 monitor reply timeout for cid=%s — the cloud "
+                "did not accept MID 23021",
+                cid[-30:],
+            )
+            return
         if rslt != 200:
             _LOGGER.error("24021 RSLT=%s — monitor rejected", rslt)
             return
@@ -476,8 +672,25 @@ class VideoCapture:
             "RCVTPC": self.coord.rcvtpc, "RLS": "0",
             "RSLT": 0, "LEN": 0, "SID": now_sid(), "CID": cid,
         }, "BODY": {}})
-        sdp_o2 = await asyncio.wait_for(self._mon_fut_31011, timeout=8)
+        try:
+            sdp_o2 = await asyncio.wait_for(self._mon_fut_31011, timeout=10)
+        except TimeoutError:
+            _LOGGER.error(
+                "monitor: 31011 subscriber offer timeout for cid=%s — the cloud "
+                "did not accept MID 30011",
+                cid[-30:],
+            )
+            return
+        if not sdp_o2:
+            _LOGGER.error("monitor: 31011 had no SDP body")
+            return
         _log_audio_section("monitor janus offer", sdp_o2)
+        if not _prepare_offer_video("monitor janus offer", sdp_o2):
+            _LOGGER.error(
+                "monitor: no video codec in the cloud offer can be decoded by "
+                "aiortc; aborting capture"
+            )
+            return
         sdp_o2_munged = sdp_o2.replace("a=setup:actpass", "a=setup:active")
         await pc2.setRemoteDescription(RTCSessionDescription(sdp_o2_munged, "offer"))
 
@@ -505,6 +718,10 @@ class VideoCapture:
 
     async def aclose(self) -> None:
         """Coordinator shutdown — drop any in-flight capture cleanly."""
+        stop = self._passive_stop
+        if stop is not None:
+            stop.set()
+        await self.cancel_monitor()
         await self._passive_teardown()
         await self._monitor_teardown()
 

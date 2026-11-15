@@ -1,7 +1,9 @@
 {
   "domain": "aiphone_ixg",
   "name": "Aiphone IXG",
-  "codeowners": ["@nihaopaul"],
+  "codeowners": [
+    "@nihaopaul"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/nihaopaul/hass-aiphone-ixg",
   "integration_type": "device",
@@ -16,5 +18,5 @@
     "google-crc32c>=1.1",
     "pillow>=10.0.0"
   ],
-  "version": "0.1.0"
+  "version": "0.1.1"
 }

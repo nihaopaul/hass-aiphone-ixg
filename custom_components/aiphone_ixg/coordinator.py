@@ -207,7 +207,7 @@ class AiphoneCoordinator:
     async def async_start_monitor(
         self, duration_s: int = MONITOR_DEFAULT_DURATION_S
     ) -> None:
-        self.hass.async_create_task(self.video.monitor_capture(duration_s))
+        self.video.start_monitor(duration_s)
 
     def async_answer_call(self) -> bool:
         cid = self._active_cid or getattr(self.video, "_mon_cid", None)
@@ -323,11 +323,25 @@ class AiphoneCoordinator:
     # ------------------------------------------------------------------
     @callback
     def _dispatch(self, raw: dict[str, Any], topic: str = "") -> None:
+        head = raw.get("HEADER", {}) or {}
+        mid = str(head.get("MID", ""))
+        # Signaling diagnostics: log the 3xxxx MediaRoom messages and 24021
+        # replies even when strict unit filtering later drops them.
+        if mid.startswith("31") or mid in ("24021", "24022", "24023"):
+            _LOGGER.info(
+                "IXG signaling MID=%s topic=%s cliid=%s cid=%s rslt=%s reason=%s",
+                mid,
+                topic,
+                head.get("CLIID"),
+                head.get("CID"),
+                head.get("RSLT"),
+                head.get("REASON"),
+            )
+
         if not self._is_relevant(raw, topic):
             _LOGGER.debug("IXG: ignoring message outside this unit: %s", topic)
             return
 
-        head = raw.get("HEADER", {}) or {}
         body = raw.get("BODY", {}) or {}
         flat = {**head, **body}
         mid = str(head.get("MID", ""))
@@ -377,7 +391,9 @@ class AiphoneCoordinator:
                 },
             )
             if cid:
-                source_cliid = str(head.get("CLIID") or "")
+                # On 23001 CLIID is the calling (entrance) station. On 24000 it
+                # is the receiving app slot, so it is not the peer client id.
+                source_cliid = str(head.get("CLIID") or "") if mid == "23001" else None
                 self.hass.async_create_task(
                     self.video.passive_capture(cid, self.last_caller, source_cliid)
                 )

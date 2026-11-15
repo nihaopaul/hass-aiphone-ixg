@@ -128,6 +128,9 @@ Assistant SDK / TTS notify service for announcements.
 | “room_client_ids is missing” | Run `npm run refresh-room` in the bridge and paste the updated credentials. |
 | MQTT not connected | Check outbound 8883, system clock, and that the app slot is still registered. |
 | App shows “Functionality limited / EULA” | Run `npm run accept-eula -- --yes` in the bridge, then reopen the app. |
+| `passive answer setup failed` / `Failed to set remote video description send parameters` | Fixed in 0.1.1: the integration now registers the H.264 profile offered by IXG with aiortc. The HA log prints the cloud's `m=video` block so the offered profile is visible. |
+| `monitor: 31001 ... timeout` | The cloud did not answer the monitor room offer. 0.1.1 uses IXG's `<PROPID>-<CLIID>-<SID>` call-ID format and logs every `31xxx` signaling message (including ones dropped by the unit filter). Re-test and check the log. |
+| Monitor pressed while the doorbell is ringing | A ring stores the only video slot; monitor is skipped. A ring now also pre-empts (cancels) a running monitor. |
 | Camera blank right after ring | DTLS + first H264 keyframe can take 1–3 s; check HA logs for `aiortc`/`passive track`. |
 | No door-release events from a tenant station | Local station unlocks may never reach the cloud; only app/cloud unlock events are visible. |
 | Google Home doesn’t see the camera | Expose it through Nabu Casa/Google Assistant; some Google displays support only specific stream types. |
