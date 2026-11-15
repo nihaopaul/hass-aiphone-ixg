@@ -120,6 +120,8 @@ class AiphoneCoordinator:
         self.last_caller: str = ""
         self.last_event: dict[str, Any] = {}
         self.last_door_release: dict[str, Any] = {}
+        self.last_source_no: str = ""
+        self.last_source_cliid: str = ""
         self._active_cid: str | None = None
         self._seen_cids: dict[str, float] = {}
 
@@ -364,6 +366,10 @@ class AiphoneCoordinator:
 
             display = _display_list(flat)
             self.last_caller = _display_text(flat) or "?"
+            if flat.get("SRCNO"):
+                self.last_source_no = str(flat["SRCNO"])
+            if mid == "23001" and head.get("CLIID"):
+                self.last_source_cliid = str(head["CLIID"])
             self.last_event = {
                 "ts": now,
                 "event": "incoming_call",

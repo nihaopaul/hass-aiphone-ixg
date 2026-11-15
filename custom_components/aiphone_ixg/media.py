@@ -66,6 +66,31 @@ def _filename_safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", s) or "recording"
 
 
+def _consume_task_exception(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except Exception:  # noqa: BLE001, S110 - the point is to consume it
+        pass
+
+
+def _consume_aiortc_connect_tasks() -> None:
+    """Retrieve aiortc's internal ``__connect()`` task exceptions.
+
+    aiortc schedules ``__connect()`` with ``asyncio.ensure_future()`` and keeps
+    no handle. Closing a peer connection before ICE starts makes that task
+    raise ``InvalidStateError``, which Home Assistant then logs as an
+    unhandled task exception. Attaching a consumer marks it as retrieved.
+    """
+    for task in asyncio.all_tasks():
+        coro = task.get_coro()
+        if getattr(coro, "__qualname__", "").endswith(
+            "RTCPeerConnection.__connect"
+        ):
+            task.add_done_callback(_consume_task_exception)
+
+
 def _log_audio_section(tag: str, sdp: str) -> None:
     """Print the m=audio media block + its codec/rtpmap/direction lines."""
     in_audio = False
@@ -355,7 +380,7 @@ class VideoCapture:
             if mid == "31001" and self._mon_fut_31001 and not self._mon_fut_31001.done():
                 self._mon_fut_31001.set_result(body.get("SDP", ""))
             elif mid == "24021" and self._mon_fut_24021 and not self._mon_fut_24021.done():
-                self._mon_fut_24021.set_result(head.get("RSLT"))
+                self._mon_fut_24021.set_result(raw)
             elif mid == "31011" and self._mon_fut_31011 and not self._mon_fut_31011.done():
                 self._mon_fut_31011.set_result(body.get("SDP", ""))
             elif mid == "31012" and self._mon_fut_31012 and not self._mon_fut_31012.done():
@@ -472,6 +497,7 @@ class VideoCapture:
             await pc.setRemoteDescription(RTCSessionDescription(offer_munged, "offer"))
             ans = await pc.createAnswer()
             await pc.setLocalDescription(ans)
+            _consume_aiortc_connect_tasks()
         except Exception:
             _LOGGER.exception("passive answer setup failed")
             return
@@ -533,6 +559,7 @@ class VideoCapture:
                 _LOGGER.warning("passive recorder.stop failed", exc_info=True)
         if pc is not None:
             await _log_inbound_stats(pc, "passive")
+            _consume_aiortc_connect_tasks()
             try:
                 await pc.close()
             except Exception:
@@ -579,26 +606,16 @@ class VideoCapture:
                 await self._monitor_teardown()
 
     async def _monitor_run(self, duration_s: int) -> None:
-        # PC #1 — publisher placeholder
-        pc1 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-        pc1.addTransceiver("audio", direction="sendrecv")
-        offer1 = await pc1.createOffer()
-        await pc1.setLocalDescription(RTCSessionDescription(_strip_extra_fp(offer1.sdp), "offer"))
-        end = time.time() + SDP_OFFER_GATHER_TIMEOUT_S
-        while pc1.iceGatheringState != "complete" and time.time() < end:
-            await asyncio.sleep(0.1)
-        sdp_offer1 = pc1.localDescription.sdp
-        # IXG call IDs look like "<PROPID>-<CLIID>-<SID>" (see 23001/24000);
-        # the plain "<CLIID><SID>" form used by the older WP-2MED cloud is not
-        # routable here, which left 30001/30011 unanswered.
+        # IXG creates the monitor stream only after MID 23021. The official
+        # MonitoringCall sends 23021 first and joins the media room (30011)
+        # afterwards; a 30001/31001 relay offer before 23021 is never answered.
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         cid = f"{self.coord.property_id}-{self.coord.cliid}-{now_sid()}"
         self._mon_cid = cid
-        self._mon_pc1 = pc1
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         self._mon_path = self.recordings_dir / f"monitor-{ts}.mp4"
         _LOGGER.info("🎥 monitor cid=%s -> %s", cid[-30:], self._mon_path)
 
-        # PC #2 — subscriber
+        # Subscriber (receive-only: the entrance station publishes)
         pc2 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         pc2.addTransceiver("audio", direction="recvonly")
         pc2.addTransceiver("video", direction="recvonly")
@@ -614,58 +631,96 @@ class VideoCapture:
         self._mon_recorder = rec
 
         loop = asyncio.get_event_loop()
-        self._mon_fut_31001 = loop.create_future()
         self._mon_fut_24021 = loop.create_future()
         self._mon_fut_31011 = loop.create_future()
         self._mon_fut_31012 = loop.create_future()
 
-        pcliid = self.coord.sndtpc.rsplit("/", 1)[-1]
+        # Step 1: 23021 MNT_REQ. Mirrors AiaccLibSignalingPrm: SRCNO is this
+        # app slot's terminal, DESTNO the station to monitor (last caller),
+        # TMKIND=19 is what the IXG app sends for a monitor request.
+        self.coord.publish({"HEADER": {
+            "MID": "23021", "VER": "1.0", "SYS": "3",
+            "PROPID": self.coord.property_id,
+            "CLIID": self.coord.cliid,
+            "SRCNO": self.coord.terminal_no,
+            "DESTNO": self.coord.last_source_no or "",
+            "TMKIND": 19, "PRI": 0, "TTIME": 0, "MTIME": 0,
+            "DSP": [self.coord.termname],
+            "CKIND": 1, "CID": cid,
+            "RECKIND": 0, "AVID": 0,
+            "SNDTPC": self.coord.sndtpc, "RCVTPC": self.coord.rcvtpc,
+            "REASON": 0,
+            "RSLT": 0, "LEN": 0, "SID": now_sid(),
+        }})
+        try:
+            reply = await asyncio.wait_for(self._mon_fut_24021, timeout=10)
+        except TimeoutError:
+            _LOGGER.error(
+                "monitor: 24021 monitor reply timeout for cid=%s "
+                "(SRCNO=%s DESTNO=%s) — the cloud did not accept MID 23021",
+                cid[-30:],
+                self.coord.terminal_no,
+                self.coord.last_source_no or "",
+            )
+            return
+        reply_head = reply.get("HEADER", {}) or {}
+        rslt = reply_head.get("RSLT")
+        if rslt != 200:
+            _LOGGER.error("monitor: 24021 RSLT=%s — monitor rejected", rslt)
+            return
 
-        # Step 1: 30001 publisher
+        # Step 2 (best effort): 30001 relay/publisher offer. The IXG app starts
+        # its audio sender after the monitor reply and the cloud answers 31001.
+        # A failure here is not fatal: the subscriber below is what carries the
+        # entrance station's video.
+        pc1 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        pc1.addTransceiver("audio", direction="sendrecv")
+        offer1 = await pc1.createOffer()
+        await pc1.setLocalDescription(
+            RTCSessionDescription(_strip_extra_fp(offer1.sdp), "offer")
+        )
+        _consume_aiortc_connect_tasks()
+        end = time.time() + SDP_OFFER_GATHER_TIMEOUT_S
+        while pc1.iceGatheringState != "complete" and time.time() < end:
+            await asyncio.sleep(0.1)
+        sdp_offer1 = pc1.localDescription.sdp
+        self._mon_pc1 = pc1
+        self._mon_fut_31001 = loop.create_future()
         self.coord.publish({"HEADER": {
             "MID": "30001", "VER": "1.0", "SYS": "3",
             "CLIID": self.coord.cliid, "RCVTPC": self.coord.rcvtpc, "RLS": "0",
             "RSLT": 0, "LEN": len(sdp_offer1), "SID": now_sid(), "CID": cid,
         }, "BODY": {"SDP": sdp_offer1}})
         try:
-            sdp_a1 = await asyncio.wait_for(self._mon_fut_31001, timeout=10)
+            sdp_a1 = await asyncio.wait_for(self._mon_fut_31001, timeout=8)
+            if sdp_a1:
+                try:
+                    await pc1.setRemoteDescription(
+                        RTCSessionDescription(sdp_a1, "answer")
+                    )
+                    _consume_aiortc_connect_tasks()
+                except Exception:
+                    _LOGGER.warning(
+                        "monitor: 31001 relay answer rejected; continuing "
+                        "receive-only",
+                        exc_info=True,
+                    )
+            else:
+                _LOGGER.warning("monitor: 31001 had no SDP body")
         except TimeoutError:
-            _LOGGER.error(
-                "monitor: 31001 publisher answer timeout for cid=%s — the cloud "
-                "did not accept MID 30001",
+            _LOGGER.warning(
+                "monitor: 31001 relay answer timeout for cid=%s; continuing "
+                "receive-only",
                 cid[-30:],
             )
-            return
-        if not sdp_a1:
-            _LOGGER.error("monitor: 31001 had no SDP body")
-            return
-        await pc1.setRemoteDescription(RTCSessionDescription(sdp_a1, "answer"))
 
-        # Step 2: 23021 MNT_REQ
-        self.coord.publish({"HEADER": {
-            "MID": "23021", "VER": "1.0", "SYS": "3",
-            "CLIID": self.coord.cliid, "PCLIID": pcliid,
-            "DSP1": self.coord.termname, "DSP2": "@",
-            "CKIND": 1, "CID": cid,
-            "RECKIND": 0, "AVID": 0,
-            "SNDTPC": self.coord.sndtpc, "RCVTPC": self.coord.rcvtpc,
-            "REASON": 0, "TMKIND": 5, "TMID": 1281,
-            "RSLT": 0, "LEN": 0, "SID": now_sid(),
-        }})
-        try:
-            rslt = await asyncio.wait_for(self._mon_fut_24021, timeout=10)
-        except TimeoutError:
-            _LOGGER.error(
-                "monitor: 24021 monitor reply timeout for cid=%s — the cloud "
-                "did not accept MID 23021",
-                cid[-30:],
-            )
-            return
-        if rslt != 200:
-            _LOGGER.error("24021 RSLT=%s — monitor rejected", rslt)
-            return
-
-        # Step 3: 30011 subscriber claim
+        # Step 3: 30011 add receiving user → 31011 offer. The native
+        # add_rcv_user_req carries only the correlated peer client id.
+        pcliid = (
+            self.coord.last_source_cliid
+            or str(reply_head.get("CLIID") or "")
+            or self.coord.sndtpc.rsplit("/", 1)[-1]
+        )
         self.coord.publish({"HEADER": {
             "MID": "30011", "VER": "1.0", "SYS": "3",
             "CLIID": self.coord.cliid, "PCLIID": pcliid,
@@ -676,9 +731,9 @@ class VideoCapture:
             sdp_o2 = await asyncio.wait_for(self._mon_fut_31011, timeout=10)
         except TimeoutError:
             _LOGGER.error(
-                "monitor: 31011 subscriber offer timeout for cid=%s — the cloud "
-                "did not accept MID 30011",
+                "monitor: 31011 subscriber offer timeout for cid=%s (PCLIID=%s)",
                 cid[-30:],
+                pcliid,
             )
             return
         if not sdp_o2:
@@ -693,10 +748,12 @@ class VideoCapture:
             return
         sdp_o2_munged = sdp_o2.replace("a=setup:actpass", "a=setup:active")
         await pc2.setRemoteDescription(RTCSessionDescription(sdp_o2_munged, "offer"))
+        _consume_aiortc_connect_tasks()
 
         # Step 4: 30012 answer
         ans2 = await pc2.createAnswer()
         await pc2.setLocalDescription(RTCSessionDescription(_strip_extra_fp(ans2.sdp), "answer"))
+        _consume_aiortc_connect_tasks()
         end = time.time() + SDP_OFFER_GATHER_TIMEOUT_S
         while pc2.iceGatheringState != "complete" and time.time() < end:
             await asyncio.sleep(0.1)
@@ -738,6 +795,7 @@ class VideoCapture:
                 _LOGGER.warning("monitor recorder.stop failed", exc_info=True)
         if pc2 is not None:
             await _log_inbound_stats(pc2, "monitor")
+        _consume_aiortc_connect_tasks()
         for pc in (pc2, pc1):
             if pc is not None:
                 try:
