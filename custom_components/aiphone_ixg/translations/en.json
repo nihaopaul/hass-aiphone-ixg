@@ -1,0 +1,25 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Aiphone IXG credentials",
+        "description": "Paste the complete contents of the IXG bridge's `.state/credentials.json` file. The bridge must have already registered a virtual app slot. No MQTT broker is required; Home Assistant connects to the Aiphone cloud directly.",
+        "data": {
+          "credentials": "Credentials JSON"
+        }
+      }
+    },
+    "error": {
+      "invalid_json": "That is not valid JSON.",
+      "missing_fields": "The credentials file is missing one or more required fields.",
+      "invalid_certificate": "The client certificate is not a PEM certificate.",
+      "invalid_private_key": "The private key is not a PEM private key.",
+      "missing_receive_topics": "The credentials file has no rcv_topics.",
+      "room_list_missing": "room_client_ids is missing. Run `npm run refresh-room` in the bridge and paste the updated credentials.",
+      "unknown": "Unexpected error; check the Home Assistant log."
+    },
+    "abort": {
+      "already_configured": "This IXG app slot is already configured."
+    }
+  }
+}

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.state/
+unit-qr.*
+*.pem
+*.key
+node_modules/
+.DS_Store
+.ruff_cache/
