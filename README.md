@@ -70,7 +70,7 @@ entry. Treat your HA backup as sensitive.
 | `lock.…_door` | Momentary door release |
 | `camera.…_entrance` | Live frame during a ring; latest recording otherwise |
 | `image.…_last_snapshot` | First frame of the last recording |
-| `button.…_monitor` | Active monitor capture |
+| `button.…_monitor` | Active monitor capture (the station can take up to ~45 s to send its `30021` media offer) |
 | `button.…_answer` | Answer the ringing call |
 
 ## HA events
@@ -119,6 +119,14 @@ Assistant SDK / TTS notify service for announcements.
   Other units' messages are discarded before state handling.
 - **Camera** is snapshot/last-frame oriented. Live HA streaming would need an
   additional HLS/RTSP path.
+- **Monitor media has two paths.** The entrance station may send a direct
+  `30021` SDP offer (answered with `31021`), or the cloud room is joined with
+  `30011`/`31011`/`30012`. If the station and Home Assistant are on different
+  VLANs, the direct path may not carry RTP; the cloud-room path is then
+  required. The log shows which path was used.
+- **Monitor needs a target station.** The last caller's `SRCNO` is remembered
+  and persisted; ring the doorbell once after installing before pressing
+  Monitor the first time.
 - Firmware/cloud changes can break the protocol. Use on equipment you own.
 
 ## Troubleshooting
@@ -129,9 +137,10 @@ Assistant SDK / TTS notify service for announcements.
 | MQTT not connected | Check outbound 8883, system clock, and that the app slot is still registered. |
 | App shows “Functionality limited / EULA” | Run `npm run accept-eula -- --yes` in the bridge, then reopen the app. |
 | `passive answer setup failed` / `Failed to set remote video description send parameters` | Fixed in 0.1.1: the integration now registers the H.264 profile offered by IXG with aiortc. The HA log prints the cloud's `m=video` block so the offered profile is visible. |
-| `monitor: 24021 ... timeout` | The monitor request was not accepted. 0.1.3 sends MID 23021 first (like the IXG app) with `SRCNO`/`DESTNO`; `DESTNO` is remembered from the last ring and persisted across HA restarts. Ring the doorbell once after installing, then press Monitor. |
-| `monitor: 24021 RSLT=480` | `REP_UNAVAILABLE` from the IXG app's reply codes: the target station number was empty or the station is not currently monitorable. The error log now prints the `SRCNO`/`DESTNO` that were sent and the full reply header. |
-| `monitor: 31011 ... timeout` | The monitor room was accepted but no subscriber offer arrived. Check the `IXG signaling` log lines: the cloud must echo `CID` and send `31011`. |
+| `monitor: 24021 ... timeout` | The monitor request was not accepted. 0.1.4 sends MID 23021 first (like the IXG app) with `SRCNO`/`DESTNO`; `DESTNO` is remembered from the last ring and persisted across HA restarts. Ring the doorbell once after installing, then press Monitor. |
+| `monitor: 24021 RSLT=480` | `REP_UNAVAILABLE`. This is not fatal in 0.1.4: the station often sends its own `30021` SDP offer anyway, and the integration waits for it and answers `31021`. The log prints `SRCNO`/`DESTNO`; if `DESTNO` is `<none>`, ring the doorbell once first. |
+| `monitor: direct 30021 offer` / `31021 sent` | The entrance station offered its media directly. The integration answered and started recording. If no RTP arrives, the station cannot reach the HA host (different VLAN); the cloud room path (`30011`/`31011`) is the fallback. |
+| `monitor: 31011 ... timeout` | The monitor room path did not produce a subscriber offer. 0.1.4 falls back to waiting for the station's direct `30021` offer. Check the `IXG signaling` log lines. |
 | Unhandled `RTCIceTransport is closed` task | Suppressed in 0.1.2; aiortc's internal `__connect()` task is now consumed during teardown. |
 | Monitor pressed while the doorbell is ringing | A ring stores the only video slot; monitor is skipped. A ring now also pre-empts (cancels) a running monitor. |
 | Camera blank right after ring | DTLS + first H264 keyframe can take 1–3 s; check HA logs for `aiortc`/`passive track`. |

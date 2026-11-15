@@ -62,6 +62,21 @@ def _strip_extra_fp(sdp: str) -> str:
     )
 
 
+def _munge_offer(sdp: str) -> str:
+    """Make an IXG/Janus offer palatable to aiortc.
+
+    - actpass -> active so aiortc becomes the passive DTLS peer.
+    - drop bare ``a=ssrc:<id>`` lines: IXG emits them without the attribute
+      aiortc's SDP parser requires, which otherwise raises ValueError.
+    """
+    sdp = sdp.replace("a=setup:actpass", "a=setup:active")
+    return "\r\n".join(
+        ln
+        for ln in sdp.split("\r\n")
+        if not (ln.startswith("a=ssrc:") and " " not in ln)
+    )
+
+
 def _filename_safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", s) or "recording"
 
@@ -352,6 +367,7 @@ class VideoCapture:
         self._mon_path: Path | None = None
         self._mon_cid: str | None = None
         self._mon_task: asyncio.Task | None = None
+        self._mon_fut_30021: asyncio.Future | None = None
         self._mon_fut_31001: asyncio.Future | None = None
         self._mon_fut_24021: asyncio.Future | None = None
         self._mon_fut_31011: asyncio.Future | None = None
@@ -393,7 +409,9 @@ class VideoCapture:
 
         # active monitor flow
         if cid is not None and cid == self._mon_cid:
-            if mid == "31001" and self._mon_fut_31001 and not self._mon_fut_31001.done():
+            if mid == "30021" and self._mon_fut_30021 and not self._mon_fut_30021.done():
+                self._mon_fut_30021.set_result(raw)
+            elif mid == "31001" and self._mon_fut_31001 and not self._mon_fut_31001.done():
                 self._mon_fut_31001.set_result(body.get("SDP", ""))
             elif mid == "24021" and self._mon_fut_24021 and not self._mon_fut_24021.done():
                 self._mon_fut_24021.set_result(raw)
@@ -508,7 +526,7 @@ class VideoCapture:
             return
 
         # Step 3: setRemoteDescription with actpass→active munge, createAnswer
-        offer_munged = offer_sdp.replace("a=setup:actpass", "a=setup:active")
+        offer_munged = _munge_offer(offer_sdp)
         try:
             await pc.setRemoteDescription(RTCSessionDescription(offer_munged, "offer"))
             ans = await pc.createAnswer()
@@ -622,16 +640,18 @@ class VideoCapture:
                 await self._monitor_teardown()
 
     async def _monitor_run(self, duration_s: int) -> None:
-        # IXG creates the monitor stream only after MID 23021. The official
-        # MonitoringCall sends 23021 first and joins the media room (30011)
-        # afterwards; a 30001/31001 relay offer before 23021 is never answered.
+        # IXG monitor media arrives one of two ways:
+        #   1. the station sends MID 30021 with an SDP offer (direct/LAN path),
+        #      which is answered with 31021, or
+        #   2. 24021 reports success and 30011/31011 joins the cloud room.
+        # The 24021 reply can be 480/busy while the 30021 offer is still valid,
+        # so never abort just because 24021 is not 200.
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         cid = f"{self.coord.property_id}-{self.coord.cliid}-{now_sid()}"
         self._mon_cid = cid
         self._mon_path = self.recordings_dir / f"monitor-{ts}.mp4"
         _LOGGER.info("🎥 monitor cid=%s -> %s", cid[-30:], self._mon_path)
 
-        # Subscriber (receive-only: the entrance station publishes)
         pc2 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         pc2.addTransceiver("audio", direction="recvonly")
         pc2.addTransceiver("video", direction="recvonly")
@@ -647,13 +667,11 @@ class VideoCapture:
         self._mon_recorder = rec
 
         loop = asyncio.get_event_loop()
+        self._mon_fut_30021 = loop.create_future()
         self._mon_fut_24021 = loop.create_future()
         self._mon_fut_31011 = loop.create_future()
         self._mon_fut_31012 = loop.create_future()
 
-        # Step 1: 23021 MNT_REQ. Mirrors AiaccLibSignalingPrm: SRCNO is this
-        # app slot's terminal, DESTNO the station to monitor (last caller),
-        # TMKIND=19 is what the IXG app sends for a monitor request.
         if not self.coord.last_source_no:
             _LOGGER.warning(
                 "monitor: no target station remembered yet — ring the doorbell "
@@ -673,81 +691,59 @@ class VideoCapture:
             "REASON": 0,
             "RSLT": 0, "LEN": 0, "SID": now_sid(),
         }})
-        try:
-            reply = await asyncio.wait_for(self._mon_fut_24021, timeout=10)
-        except TimeoutError:
+
+        done, _ = await asyncio.wait(
+            {self._mon_fut_30021, self._mon_fut_24021},
+            timeout=45,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
             _LOGGER.error(
-                "monitor: 24021 monitor reply timeout for cid=%s "
-                "(SRCNO=%s DESTNO=%s) — the cloud did not accept MID 23021",
+                "monitor: no 24021/30021 after 23021 for cid=%s "
+                "(SRCNO=%s DESTNO=%s)",
                 cid[-30:],
                 self.coord.terminal_no,
-                self.coord.last_source_no or "",
+                self.coord.last_source_no or "<none>",
             )
             return
+
+        if self._mon_fut_30021 in done:
+            raw = self._mon_fut_30021.result()
+            if await self._monitor_direct(pc2, rec, raw, cid):
+                await asyncio.sleep(duration_s)
+            return
+
+        reply = self._mon_fut_24021.result()
         reply_head = reply.get("HEADER", {}) or {}
         rslt = reply_head.get("RSLT")
         if rslt != 200:
-            _LOGGER.error(
-                "monitor: 24021 RSLT=%s (%s) — request SRCNO=%s DESTNO=%s "
-                "TMKIND=19; reply=%s",
+            _LOGGER.warning(
+                "monitor: 24021 RSLT=%s (%s) — request SRCNO=%s DESTNO=%s; "
+                "still waiting for the station's 30021 media offer",
                 rslt,
                 _REPLY_CODE_NAMES.get(rslt, "unknown"),
                 self.coord.terminal_no,
                 self.coord.last_source_no or "<none>",
-                reply_head,
             )
+            try:
+                raw = await asyncio.wait_for(
+                    asyncio.shield(self._mon_fut_30021), timeout=50
+                )
+            except TimeoutError:
+                _LOGGER.error(
+                    "monitor: no 30021 media offer for cid=%s after 24021 RSLT=%s",
+                    cid[-30:],
+                    rslt,
+                )
+                return
+            if await self._monitor_direct(pc2, rec, raw, cid):
+                await asyncio.sleep(duration_s)
             return
 
-        # Step 2 (best effort): 30001 relay/publisher offer. The IXG app starts
-        # its audio sender after the monitor reply and the cloud answers 31001.
-        # A failure here is not fatal: the subscriber below is what carries the
-        # entrance station's video.
-        pc1 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-        pc1.addTransceiver("audio", direction="sendrecv")
-        offer1 = await pc1.createOffer()
-        await pc1.setLocalDescription(
-            RTCSessionDescription(_strip_extra_fp(offer1.sdp), "offer")
-        )
-        _consume_aiortc_connect_tasks()
-        end = time.time() + SDP_OFFER_GATHER_TIMEOUT_S
-        while pc1.iceGatheringState != "complete" and time.time() < end:
-            await asyncio.sleep(0.1)
-        sdp_offer1 = pc1.localDescription.sdp
-        self._mon_pc1 = pc1
-        self._mon_fut_31001 = loop.create_future()
-        self.coord.publish({"HEADER": {
-            "MID": "30001", "VER": "1.0", "SYS": "3",
-            "CLIID": self.coord.cliid, "RCVTPC": self.coord.rcvtpc, "RLS": "0",
-            "RSLT": 0, "LEN": len(sdp_offer1), "SID": now_sid(), "CID": cid,
-        }, "BODY": {"SDP": sdp_offer1}})
-        try:
-            sdp_a1 = await asyncio.wait_for(self._mon_fut_31001, timeout=8)
-            if sdp_a1:
-                try:
-                    await pc1.setRemoteDescription(
-                        RTCSessionDescription(sdp_a1, "answer")
-                    )
-                    _consume_aiortc_connect_tasks()
-                except Exception:
-                    _LOGGER.warning(
-                        "monitor: 31001 relay answer rejected; continuing "
-                        "receive-only",
-                        exc_info=True,
-                    )
-            else:
-                _LOGGER.warning("monitor: 31001 had no SDP body")
-        except TimeoutError:
-            _LOGGER.warning(
-                "monitor: 31001 relay answer timeout for cid=%s; continuing "
-                "receive-only",
-                cid[-30:],
-            )
-
-        # Step 3: 30011 add receiving user → 31011 offer. The native
-        # add_rcv_user_req carries only the correlated peer client id.
+        # 24021 = 200: join the cloud room as a receiving user.
         pcliid = (
-            self.coord.last_source_cliid
-            or str(reply_head.get("CLIID") or "")
+            str(reply_head.get("CLIID") or "")
+            or self.coord.last_source_cliid
             or self.coord.sndtpc.rsplit("/", 1)[-1]
         )
         self.coord.publish({"HEADER": {
@@ -759,12 +755,23 @@ class VideoCapture:
         try:
             sdp_o2 = await asyncio.wait_for(self._mon_fut_31011, timeout=10)
         except TimeoutError:
-            _LOGGER.error(
-                "monitor: 31011 subscriber offer timeout for cid=%s (PCLIID=%s)",
+            _LOGGER.warning(
+                "monitor: 31011 subscriber offer timeout for cid=%s (PCLIID=%s); "
+                "waiting for a direct 30021 offer",
                 cid[-30:],
                 pcliid,
             )
+            try:
+                raw = await asyncio.wait_for(
+                    asyncio.shield(self._mon_fut_30021), timeout=50
+                )
+            except TimeoutError:
+                _LOGGER.error("monitor: no subscriber or direct media offer")
+                return
+            if await self._monitor_direct(pc2, rec, raw, cid):
+                await asyncio.sleep(duration_s)
             return
+
         if not sdp_o2:
             _LOGGER.error("monitor: 31011 had no SDP body")
             return
@@ -775,13 +782,15 @@ class VideoCapture:
                 "aiortc; aborting capture"
             )
             return
-        sdp_o2_munged = sdp_o2.replace("a=setup:actpass", "a=setup:active")
-        await pc2.setRemoteDescription(RTCSessionDescription(sdp_o2_munged, "offer"))
+        await pc2.setRemoteDescription(
+            RTCSessionDescription(_munge_offer(sdp_o2), "offer")
+        )
         _consume_aiortc_connect_tasks()
 
-        # Step 4: 30012 answer
         ans2 = await pc2.createAnswer()
-        await pc2.setLocalDescription(RTCSessionDescription(_strip_extra_fp(ans2.sdp), "answer"))
+        await pc2.setLocalDescription(
+            RTCSessionDescription(_strip_extra_fp(ans2.sdp), "answer")
+        )
         _consume_aiortc_connect_tasks()
         end = time.time() + SDP_OFFER_GATHER_TIMEOUT_S
         while pc2.iceGatheringState != "complete" and time.time() < end:
@@ -799,8 +808,61 @@ class VideoCapture:
             _LOGGER.warning("31012 timeout (non-fatal)")
 
         await rec.start()
-        _LOGGER.info("🎬 monitor recording, holding %ss", duration_s)
+        _LOGGER.info("🎬 monitor room recording, holding %ss", duration_s)
         await asyncio.sleep(duration_s)
+
+    async def _monitor_direct(
+        self, pc2: RTCPeerConnection, rec: MediaRecorder, raw: dict, cid: str
+    ) -> bool:
+        """Answer the station's 30021 SDP offer with 31021."""
+        head = raw.get("HEADER", {}) or {}
+        sdp = (raw.get("BODY") or {}).get("SDP", "")
+        if not sdp:
+            _LOGGER.error("monitor: direct 30021 had no SDP body")
+            return False
+        _log_audio_section("monitor direct offer", sdp)
+        if not _prepare_offer_video("monitor direct offer", sdp):
+            _LOGGER.error(
+                "monitor: direct 30021 offer has no video codec aiortc can decode"
+            )
+            return False
+        try:
+            await pc2.setRemoteDescription(
+                RTCSessionDescription(_munge_offer(sdp), "offer")
+            )
+            _consume_aiortc_connect_tasks()
+            ans = await pc2.createAnswer()
+            await pc2.setLocalDescription(
+                RTCSessionDescription(_strip_extra_fp(ans.sdp), "answer")
+            )
+            _consume_aiortc_connect_tasks()
+        except Exception:
+            _LOGGER.exception("monitor: direct 30021 answer failed")
+            return False
+        end = time.time() + SDP_OFFER_GATHER_TIMEOUT_S
+        while pc2.iceGatheringState != "complete" and time.time() < end:
+            await asyncio.sleep(0.1)
+        answer = pc2.localDescription.sdp
+        pcliid = str(head.get("CLIID") or self.coord.last_source_cliid or "")
+        self.coord.publish({"HEADER": {
+            "MID": "31021", "VER": "1.0", "SYS": "3",
+            "CLIID": self.coord.cliid, "PCLIID": pcliid,
+            "CID": cid, "RSLT": 200, "REASON": 0, "RLS": "0",
+            "SNDTPC": self.coord.sndtpc,
+            "RCVTPC": head.get("SNDTPC") or self.coord.rcvtpc,
+            "MEDIATYPE": head.get("MEDIATYPE", 3),
+            "LEN": len(answer), "SID": now_sid(),
+        }, "BODY": {"SDP": answer}})
+        _LOGGER.info("🎬 monitor direct 31021 sent (station offer answered)")
+        try:
+            await rec.start()
+        except Exception:
+            _LOGGER.warning("monitor: recorder start failed", exc_info=True)
+            return False
+        asyncio.create_task(
+            _periodic_stats_logger(pc2, "monitor direct", period_s=3.0, duration_s=60.0)
+        )
+        return True
 
     async def aclose(self) -> None:
         """Coordinator shutdown — drop any in-flight capture cleanly."""
@@ -813,10 +875,27 @@ class VideoCapture:
 
     async def _monitor_teardown(self) -> None:
         rec, pc1, pc2, path = self._mon_recorder, self._mon_pc1, self._mon_pc2, self._mon_path
+        cid = self._mon_cid
         self._mon_pc1 = self._mon_pc2 = self._mon_recorder = None
         self._mon_path = self._mon_cid = None
         self._mon_fut_31001 = self._mon_fut_24021 = None
+        self._mon_fut_30021 = None
         self._mon_fut_31011 = self._mon_fut_31012 = None
+        if cid:
+            # Free the station's monitor session (the app sends 23003/30031 on hangup).
+            self.coord.publish({"HEADER": {
+                "MID": "23003", "VER": "1.0", "SYS": "3",
+                "CLIID": self.coord.cliid, "CID": cid,
+                "RSLT": 200, "REASON": 0, "LEN": 0, "SID": now_sid(),
+                "SNDTPC": self.coord.sndtpc, "RCVTPC": self.coord.rcvtpc,
+            }, "BODY": {}})
+            self.coord.publish({"HEADER": {
+                "MID": "30031", "VER": "1.0", "SYS": "3",
+                "CLIID": self.coord.cliid,
+                "PCLIID": self.coord.last_source_cliid or "",
+                "CID": cid, "RCVTPC": self.coord.rcvtpc, "RLS": "0",
+                "RSLT": 200, "REASON": 0, "LEN": 0, "SID": now_sid(),
+            }, "BODY": {}})
         if rec is not None:
             try:
                 await rec.stop()
