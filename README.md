@@ -129,7 +129,8 @@ Assistant SDK / TTS notify service for announcements.
 | MQTT not connected | Check outbound 8883, system clock, and that the app slot is still registered. |
 | App shows “Functionality limited / EULA” | Run `npm run accept-eula -- --yes` in the bridge, then reopen the app. |
 | `passive answer setup failed` / `Failed to set remote video description send parameters` | Fixed in 0.1.1: the integration now registers the H.264 profile offered by IXG with aiortc. The HA log prints the cloud's `m=video` block so the offered profile is visible. |
-| `monitor: 24021 ... timeout` | The monitor request was not accepted. 0.1.2 sends MID 23021 first (like the IXG app) with `SRCNO`/`DESTNO`; `DESTNO` comes from the last ring, so press Monitor after a call or check that an entrance station has called since HA restarted. |
+| `monitor: 24021 ... timeout` | The monitor request was not accepted. 0.1.3 sends MID 23021 first (like the IXG app) with `SRCNO`/`DESTNO`; `DESTNO` is remembered from the last ring and persisted across HA restarts. Ring the doorbell once after installing, then press Monitor. |
+| `monitor: 24021 RSLT=480` | `REP_UNAVAILABLE` from the IXG app's reply codes: the target station number was empty or the station is not currently monitorable. The error log now prints the `SRCNO`/`DESTNO` that were sent and the full reply header. |
 | `monitor: 31011 ... timeout` | The monitor room was accepted but no subscriber offer arrived. Check the `IXG signaling` log lines: the cloud must echo `CID` and send `31011`. |
 | Unhandled `RTCIceTransport is closed` task | Suppressed in 0.1.2; aiortc's internal `__connect()` task is now consumed during teardown. |
 | Monitor pressed while the doorbell is ringing | A ring stores the only video slot; monitor is skipped. A ring now also pre-empts (cancels) a running monitor. |

@@ -136,6 +136,7 @@ class AiphoneCoordinator:
     # lifecycle
     # ------------------------------------------------------------------
     async def async_start(self) -> None:
+        await self.hass.async_add_executor_job(self._load_media_state)
         await self.hass.async_add_executor_job(self._materialize_certs)
         await self.hass.async_add_executor_job(self._connect)
 
@@ -161,6 +162,40 @@ class AiphoneCoordinator:
             self._key_path.chmod(0o600)
         except OSError:
             pass
+
+    # ------------------------------------------------------------------
+    # remembered monitor target (last entrance station that called)
+    # ------------------------------------------------------------------
+    @property
+    def _state_path(self) -> Path:
+        return Path(self.hass.config.path(DOMAIN)) / "state.json"
+
+    def _load_media_state(self) -> None:
+        """Runs in executor — restore the last caller across HA restarts."""
+        try:
+            data = json.loads(self._state_path.read_text())
+        except (OSError, ValueError):
+            return
+        self.last_source_no = str(data.get("last_source_no") or "")
+        self.last_source_cliid = str(data.get("last_source_cliid") or "")
+
+    def _save_media_state(self) -> None:
+        """Runs in executor — remember the entrance station for monitoring."""
+        path = self._state_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {
+                        "last_source_no": self.last_source_no,
+                        "last_source_cliid": self.last_source_cliid,
+                    }
+                )
+            )
+            tmp.replace(path)
+        except OSError:
+            _LOGGER.warning("could not persist monitor target", exc_info=True)
 
     # ------------------------------------------------------------------
     # MQTT
@@ -366,10 +401,21 @@ class AiphoneCoordinator:
 
             display = _display_list(flat)
             self.last_caller = _display_text(flat) or "?"
-            if flat.get("SRCNO"):
-                self.last_source_no = str(flat["SRCNO"])
-            if mid == "23001" and head.get("CLIID"):
-                self.last_source_cliid = str(head["CLIID"])
+            new_source_no = str(flat.get("SRCNO") or "")
+            new_source_cliid = (
+                str(head.get("CLIID") or "") if mid == "23001" else ""
+            )
+            target_changed = False
+            if new_source_no and new_source_no != self.last_source_no:
+                self.last_source_no = new_source_no
+                target_changed = True
+            if new_source_cliid and new_source_cliid != self.last_source_cliid:
+                self.last_source_cliid = new_source_cliid
+                target_changed = True
+            if target_changed:
+                self.hass.async_create_task(
+                    self.hass.async_add_executor_job(self._save_media_state)
+                )
             self.last_event = {
                 "ts": now,
                 "event": "incoming_call",

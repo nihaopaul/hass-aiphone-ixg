@@ -80,7 +80,9 @@ class AiphoneLastSnapshot(ImageEntity):
                 pass
 
     async def async_image(self) -> bytes | None:
-        latest = self._coord.video.latest_recording
+        latest = await self.hass.async_add_executor_job(
+            lambda: self._coord.video.latest_recording
+        )
         if latest is None:
             return None
         if self._cached_path == latest and self._cached_jpeg is not None:

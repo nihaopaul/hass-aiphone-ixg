@@ -52,6 +52,7 @@ class AiphoneDoorbell(BinarySensorEntity):
         return {
             "state": self._coord.doorbell_state,
             "last_caller": self._coord.last_caller,
+            "monitor_target": self._coord.last_source_no,
             "last_door_release": self._coord.last_door_release,
             **{f"event_{k}": v for k, v in (self._coord.last_event or {}).items()},
         }

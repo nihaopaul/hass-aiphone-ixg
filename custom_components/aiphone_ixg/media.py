@@ -119,6 +119,22 @@ _H264_LOCAL_PT = 127
 _H264_DEFAULT_PROFILE = "42e01f"
 _KNOWN_H264: set[tuple[str, str]] = {("42001f", "1"), ("42e01f", "1")}
 
+# AiaccLibDef.AiaccLibReplyCode — the values IXG uses in 24021/30012 replies.
+_REPLY_CODE_NAMES = {
+    200: "OK",
+    302: "moved temporarily",
+    404: "not found",
+    410: "gone",
+    451: "unavailable for legal reasons",
+    480: "unavailable",
+    481: "does not exist",
+    486: "busy",
+    487: "priority processing",
+    488: "not acceptable here",
+    603: "rejected",
+    604: "recording file access error",
+}
+
 
 def _sdp_media_block(sdp: str, kind: str) -> list[str]:
     """Return the lines of the first ``m=<kind>`` section of an SDP."""
@@ -638,6 +654,11 @@ class VideoCapture:
         # Step 1: 23021 MNT_REQ. Mirrors AiaccLibSignalingPrm: SRCNO is this
         # app slot's terminal, DESTNO the station to monitor (last caller),
         # TMKIND=19 is what the IXG app sends for a monitor request.
+        if not self.coord.last_source_no:
+            _LOGGER.warning(
+                "monitor: no target station remembered yet — ring the doorbell "
+                "once so the entrance station can be stored, then retry"
+            )
         self.coord.publish({"HEADER": {
             "MID": "23021", "VER": "1.0", "SYS": "3",
             "PROPID": self.coord.property_id,
@@ -666,7 +687,15 @@ class VideoCapture:
         reply_head = reply.get("HEADER", {}) or {}
         rslt = reply_head.get("RSLT")
         if rslt != 200:
-            _LOGGER.error("monitor: 24021 RSLT=%s — monitor rejected", rslt)
+            _LOGGER.error(
+                "monitor: 24021 RSLT=%s (%s) — request SRCNO=%s DESTNO=%s "
+                "TMKIND=19; reply=%s",
+                rslt,
+                _REPLY_CODE_NAMES.get(rslt, "unknown"),
+                self.coord.terminal_no,
+                self.coord.last_source_no or "<none>",
+                reply_head,
+            )
             return
 
         # Step 2 (best effort): 30001 relay/publisher offer. The IXG app starts
