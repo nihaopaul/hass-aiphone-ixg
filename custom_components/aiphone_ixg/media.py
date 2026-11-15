@@ -716,6 +716,25 @@ class VideoCapture:
         reply = self._mon_fut_24021.result()
         reply_head = reply.get("HEADER", {}) or {}
         rslt = reply_head.get("RSLT")
+        if rslt in (404, 481):
+            _LOGGER.error(
+                "monitor: 24021 RSLT=%s (%s) — no target station for DESTNO=%s; "
+                "ring the doorbell once so the entrance station is remembered",
+                rslt,
+                _REPLY_CODE_NAMES.get(rslt, "unknown"),
+                self.coord.last_source_no or "<none>",
+            )
+            return
+        if rslt in (486, 488, 603):
+            _LOGGER.error(
+                "monitor: 24021 RSLT=%s (%s) — the station is busy or rejected "
+                "the monitor request. End any monitor/call on the station or in "
+                "the app, or power-cycle the IXGW gateway. The integration sends "
+                "23003/30031 on teardown to release stale sessions.",
+                rslt,
+                _REPLY_CODE_NAMES.get(rslt, "unknown"),
+            )
+            return
         if rslt != 200:
             _LOGGER.warning(
                 "monitor: 24021 RSLT=%s (%s) — request SRCNO=%s DESTNO=%s; "

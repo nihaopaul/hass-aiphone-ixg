@@ -138,7 +138,9 @@ Assistant SDK / TTS notify service for announcements.
 | App shows “Functionality limited / EULA” | Run `npm run accept-eula -- --yes` in the bridge, then reopen the app. |
 | `passive answer setup failed` / `Failed to set remote video description send parameters` | Fixed in 0.1.1: the integration now registers the H.264 profile offered by IXG with aiortc. The HA log prints the cloud's `m=video` block so the offered profile is visible. |
 | `monitor: 24021 ... timeout` | The monitor request was not accepted. 0.1.4 sends MID 23021 first (like the IXG app) with `SRCNO`/`DESTNO`; `DESTNO` is remembered from the last ring and persisted across HA restarts. Ring the doorbell once after installing, then press Monitor. |
-| `monitor: 24021 RSLT=480` | `REP_UNAVAILABLE`. This is not fatal in 0.1.4: the station often sends its own `30021` SDP offer anyway, and the integration waits for it and answers `31021`. The log prints `SRCNO`/`DESTNO`; if `DESTNO` is `<none>`, ring the doorbell once first. |
+| `monitor: 24021 RSLT=486` | `REP_BUSY`: the station is already in a monitor/call, often because a previous session was not released. End it on the station/app, or power-cycle the IXGW gateway. 0.1.5 sends `23003`/`30031` on teardown so this should not recur. |
+| `monitor: 24021 RSLT=404/481` | `not found`: no target station. Ring the doorbell once so `DESTNO` is learned, then press Monitor. |
+| `monitor: 24021 RSLT=480` | `REP_UNAVAILABLE`. 0.1.5 keeps waiting for the station's `30021` offer instead of aborting; the log prints `SRCNO`/`DESTNO`. |
 | `monitor: direct 30021 offer` / `31021 sent` | The entrance station offered its media directly. The integration answered and started recording. If no RTP arrives, the station cannot reach the HA host (different VLAN); the cloud room path (`30011`/`31011`) is the fallback. |
 | `monitor: 31011 ... timeout` | The monitor room path did not produce a subscriber offer. 0.1.4 falls back to waiting for the station's direct `30021` offer. Check the `IXG signaling` log lines. |
 | Unhandled `RTCIceTransport is closed` task | Suppressed in 0.1.2; aiortc's internal `__connect()` task is now consumed during teardown. |
