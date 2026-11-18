@@ -1,0 +1,11 @@
+fetch_recording:
+  name: Fetch cloud recording
+  description: Download a video recording from the IXG cloud. If rec_id is omitted, the most recent call's recording is fetched.
+  fields:
+    rec_id:
+      name: Recording ID
+      description: The RECID from the IXG cloud recording log.
+      required: false
+      example: "3020-7e6d26f8f661af15-20261118182206418444"
+      selector:
+        text:

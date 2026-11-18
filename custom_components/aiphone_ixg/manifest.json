@@ -18,5 +18,5 @@
     "google-crc32c>=1.1",
     "pillow>=10.0.0"
   ],
-  "version": "0.1.5"
+  "version": "0.2.0"
 }

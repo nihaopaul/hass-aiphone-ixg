@@ -122,8 +122,10 @@ class AiphoneCoordinator:
         self.last_door_release: dict[str, Any] = {}
         self.last_source_no: str = ""
         self.last_source_cliid: str = ""
+        self.last_call_cid: str | None = None
         self._active_cid: str | None = None
         self._seen_cids: dict[str, float] = {}
+        self._fetching: set[str] = set()
 
         self._client: mqtt.Client | None = None
         self._cert_path: Path | None = None
@@ -300,6 +302,11 @@ class AiphoneCoordinator:
         return next((t for t in self.rcv_topics if "/Client/" in t), None)
 
     @property
+    def client_topic(self) -> str:
+        """The app slot's own Client topic (media join lives here)."""
+        return self._client_topic or f"{self.property_id}/Client/{self.cliid}"
+
+    @property
     def _room_topic(self) -> str | None:
         return next((t for t in self.rcv_topics if "/Room/" in t), None)
 
@@ -429,6 +436,8 @@ class AiphoneCoordinator:
             self._set_doorbell(STATE_RINGING)
             self._arm_timer()
             self._active_cid = cid
+            if cid:
+                self.last_call_cid = cid
             self.hass.bus.async_fire(
                 EVENT_INCOMING_CALL,
                 {
@@ -458,6 +467,8 @@ class AiphoneCoordinator:
         elif mid in ("24003", "24004"):
             self._set_doorbell(STATE_IDLE)
             self._cancel_timer()
+            if cid:
+                self.hass.async_create_task(self._auto_fetch_cloud(cid))
             if cid and cid == self._active_cid:
                 self._active_cid = None
                 self.hass.async_create_task(self.video.passive_finalize(0))
@@ -492,10 +503,28 @@ class AiphoneCoordinator:
         elif mid == "29030":
             _LOGGER.error("IXG app slot was deregistered by the cloud")
             self.hass.bus.async_fire(EVENT_UNREGISTERED, {"device_id": self.device_id})
-        elif mid in ("31011", "31012", "31001", "24021"):
+        elif mid in ("31011", "31012", "31001", "24021", "24041"):
             self.video.on_signal(mid, raw)
 
         async_dispatcher_send(self.hass, SIGNAL_STATE_UPDATE)
+
+    async def async_fetch_recording(self, rec_id: str | None = None) -> None:
+        """Download a cloud recording by RECID (defaults to the last call)."""
+        rec_id = rec_id or self.last_call_cid
+        if not rec_id:
+            _LOGGER.warning("fetch_recording: no recording ID available")
+            return
+        await self.video.fetch_cloud_recording(rec_id)
+
+    async def _auto_fetch_cloud(self, cid: str) -> None:
+        if cid in self._fetching:
+            return
+        self._fetching.add(cid)
+        try:
+            await asyncio.sleep(8)
+            await self.video.fetch_cloud_recording(cid, attempts=3)
+        finally:
+            self._fetching.discard(cid)
 
     def _set_doorbell(self, new_state: str) -> None:
         if new_state == self.doorbell_state:

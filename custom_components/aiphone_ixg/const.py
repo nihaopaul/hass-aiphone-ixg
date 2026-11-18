@@ -52,3 +52,6 @@ EVENT_INCOMING_CALL = f"{DOMAIN}_incoming_call"
 EVENT_DOOR_RELEASE = f"{DOMAIN}_door_release"
 EVENT_MEDIA_READY = f"{DOMAIN}_media_ready"
 EVENT_UNREGISTERED = f"{DOMAIN}_unregistered"
+
+# Services
+SERVICE_FETCH_RECORDING = "fetch_recording"

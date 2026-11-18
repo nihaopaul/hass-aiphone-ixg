@@ -373,6 +373,13 @@ class VideoCapture:
         self._mon_fut_31011: asyncio.Future | None = None
         self._mon_fut_31012: asyncio.Future | None = None
 
+        # cloud recording playback
+        self._play_cid: str | None = None
+        self._play_fut_24041: asyncio.Future | None = None
+        self._play_fut_31011: asyncio.Future | None = None
+        self._play_fut_31012: asyncio.Future | None = None
+        self._play_lock = asyncio.Lock()
+
     @property
     def recordings_dir(self) -> Path:
         d = Path(self.coord.hass.config.path(RECORDINGS_SUBDIR))
@@ -397,14 +404,29 @@ class VideoCapture:
     # ------------------------------------------------------------------
     # signaling routing — coordinator forwards relevant MQTT messages
     # ------------------------------------------------------------------
+    def _offer_is_ours(self, head: dict) -> bool:
+        """Only accept media offers addressed to this app slot."""
+        offer_cliid = str(head.get("CLIID") or "")
+        offer_pcliid = str(head.get("PCLIID") or "")
+        return offer_cliid in ("", self.coord.cliid) or offer_pcliid == self.coord.cliid
+
     def on_signal(self, mid: str, raw: dict) -> None:
         head = raw.get("HEADER", {}) or {}
         body = raw.get("BODY", {}) or {}
         cid = head.get("CID")
 
+        # cloud recording playback
+        if cid is not None and cid == self._play_cid:
+            if mid == "24041" and self._play_fut_24041 and not self._play_fut_24041.done():
+                self._play_fut_24041.set_result(raw)
+            elif mid == "31011" and self._play_fut_31011 and not self._play_fut_31011.done() and self._offer_is_ours(head):
+                self._play_fut_31011.set_result(raw)
+            elif mid == "31012" and self._play_fut_31012 and not self._play_fut_31012.done():
+                self._play_fut_31012.set_result(head.get("RSLT"))
+
         # passive doorbell flow
         if cid is not None and cid == self._passive_cid:
-            if mid == "31011" and self._passive_offer_fut and not self._passive_offer_fut.done():
+            if mid == "31011" and self._passive_offer_fut and not self._passive_offer_fut.done() and self._offer_is_ours(head):
                 self._passive_offer_fut.set_result(raw)
 
         # active monitor flow
@@ -415,7 +437,7 @@ class VideoCapture:
                 self._mon_fut_31001.set_result(body.get("SDP", ""))
             elif mid == "24021" and self._mon_fut_24021 and not self._mon_fut_24021.done():
                 self._mon_fut_24021.set_result(raw)
-            elif mid == "31011" and self._mon_fut_31011 and not self._mon_fut_31011.done():
+            elif mid == "31011" and self._mon_fut_31011 and not self._mon_fut_31011.done() and self._offer_is_ours(head):
                 self._mon_fut_31011.set_result(body.get("SDP", ""))
             elif mid == "31012" and self._mon_fut_31012 and not self._mon_fut_31012.done():
                 self._mon_fut_31012.set_result(head.get("RSLT"))
@@ -502,7 +524,7 @@ class VideoCapture:
         msg = {"HEADER": {
             "MID": "30011", "VER": "1.0", "SYS": "3",
             "CLIID": self.coord.cliid, "PCLIID": pcliid,
-            "RCVTPC": self.coord.rcvtpc, "RLS": "0",
+            "RCVTPC": self.coord.client_topic, "RLS": "0",
             "RSLT": 0, "LEN": 0, "SID": now_sid(), "CID": cid,
         }, "BODY": {}}
         self.coord.publish(msg)
@@ -544,7 +566,7 @@ class VideoCapture:
         msg2 = {"HEADER": {
             "MID": "30012", "VER": "1.0", "SYS": "3",
             "CLIID": self.coord.cliid, "PCLIID": pcliid,
-            "RCVTPC": self.coord.rcvtpc, "RLS": "0",
+            "RCVTPC": self.coord.client_topic, "RLS": "0",
             "RSLT": 0, "LEN": len(answer_sdp), "SID": now_sid(), "CID": cid,
         }, "BODY": {"SDP": answer_sdp}}
         self.coord.publish(msg2)
@@ -768,7 +790,7 @@ class VideoCapture:
         self.coord.publish({"HEADER": {
             "MID": "30011", "VER": "1.0", "SYS": "3",
             "CLIID": self.coord.cliid, "PCLIID": pcliid,
-            "RCVTPC": self.coord.rcvtpc, "RLS": "0",
+            "RCVTPC": self.coord.client_topic, "RLS": "0",
             "RSLT": 0, "LEN": 0, "SID": now_sid(), "CID": cid,
         }, "BODY": {}})
         try:
@@ -818,7 +840,7 @@ class VideoCapture:
         self.coord.publish({"HEADER": {
             "MID": "30012", "VER": "1.0", "SYS": "3",
             "CLIID": self.coord.cliid, "PCLIID": pcliid,
-            "RCVTPC": self.coord.rcvtpc, "RLS": "0",
+            "RCVTPC": self.coord.client_topic, "RLS": "0",
             "RSLT": 0, "LEN": len(answer2), "SID": now_sid(), "CID": cid,
         }, "BODY": {"SDP": answer2}})
         try:
@@ -882,6 +904,116 @@ class VideoCapture:
             _periodic_stats_logger(pc2, "monitor direct", period_s=3.0, duration_s=60.0)
         )
         return True
+
+    async def fetch_cloud_recording(self, rec_id: str, attempts: int = 2) -> Path | None:
+        """Download a cloud recording via the phone-style 23041/30011/31011 flow."""
+        async with self._play_lock:
+            existing = sorted(self.recordings_dir.glob(f"cloud-*-{rec_id[-14:]}.mp4"))
+            if existing and existing[-1].stat().st_size > 1000:
+                _LOGGER.info("cloud recording already exists: %s", existing[-1])
+                return existing[-1]
+            out = self.recordings_dir / f"cloud-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{rec_id[-14:]}.mp4"
+            offer_raw = None
+            cid = None
+            for attempt in range(attempts):
+                cid = f"{self.coord.property_id}-{self.coord.cliid}-{now_sid()}"
+                self._play_cid = cid
+                loop = asyncio.get_running_loop()
+                self._play_fut_24041 = loop.create_future()
+                self._play_fut_31011 = loop.create_future()
+                self._play_fut_31012 = loop.create_future()
+                self.coord.publish({"HEADER": {
+                    "MID": "23041", "PROPID": self.coord.property_id,
+                    "CLIID": self.coord.cliid, "RECID": rec_id,
+                    "CKIND": 0, "PRI": 0, "CID": cid,
+                    "CTIME": 0, "TTIME": 0, "MTIME": 0, "RSLT": 0,
+                    "SNDTPC": self.coord.sndtpc, "RCVTPC": self.coord.client_topic,
+                    "REASON": 0, "RECEPTFLAG": 0, "MOBILECALL": 0,
+                    "VER": "1.0", "SYS": "3", "LEN": 0, "SID": now_sid(),
+                }, "BODY": {}})
+                try:
+                    reply = await asyncio.wait_for(self._play_fut_24041, timeout=8)
+                except TimeoutError:
+                    reply = None
+                rslt = (reply or {}).get("HEADER", {}).get("RSLT")
+                if reply is not None and str(rslt) == "200":
+                    self.coord.publish({"HEADER": {
+                        "MID": "30011", "CID": cid, "PROPID": self.coord.property_id,
+                        "CLIID": self.coord.cliid, "RSLT": 0,
+                        "RCVTPC": self.coord.client_topic, "RLS": "0",
+                        "VER": "1.0", "SYS": "3", "LEN": 0, "SID": now_sid(),
+                    }, "BODY": {}})
+                    try:
+                        offer_raw = await asyncio.wait_for(self._play_fut_31011, timeout=15)
+                        break
+                    except TimeoutError:
+                        _LOGGER.warning("cloud recording: 31011 timeout (attempt %d)", attempt + 1)
+                else:
+                    _LOGGER.warning("cloud recording: 24041 not successful (attempt %d)", attempt + 1)
+                if cid:
+                    self.coord.publish({"HEADER": {
+                        "MID": "30031", "CID": cid, "PROPID": self.coord.property_id,
+                        "CLIID": self.coord.cliid, "RSLT": 0,
+                        "RCVTPC": self.coord.client_topic, "RLS": "0",
+                        "VER": "1.0", "SYS": "3", "LEN": 0, "SID": now_sid(),
+                    }, "BODY": {}})
+                await asyncio.sleep(8)
+            self._play_cid = None
+            self._play_fut_24041 = self._play_fut_31011 = self._play_fut_31012 = None
+            if not offer_raw:
+                return None
+            sdp = (offer_raw.get("BODY") or {}).get("SDP", "")
+            if not sdp or not _prepare_offer_video("cloud recording offer", sdp):
+                return None
+            pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+            pc.addTransceiver("video", direction="recvonly")
+            rec = MediaRecorder(str(out))
+            @pc.on("track")
+            def _on_track(track):
+                if track.kind == "video":
+                    rec.addTrack(track)
+            try:
+                await pc.setRemoteDescription(RTCSessionDescription(_munge_offer(sdp), "offer"))
+                ans = await pc.createAnswer()
+                await pc.setLocalDescription(RTCSessionDescription(_strip_extra_fp(ans.sdp), "answer"))
+                _consume_aiortc_connect_tasks()
+                end = time.time() + SDP_OFFER_GATHER_TIMEOUT_S
+                while pc.iceGatheringState != "complete" and time.time() < end:
+                    await asyncio.sleep(0.1)
+                answer = pc.localDescription.sdp
+                self.coord.publish({"HEADER": {
+                    "MID": "30012", "CID": cid, "PROPID": self.coord.property_id,
+                    "CLIID": self.coord.cliid, "RSLT": 0,
+                    "RCVTPC": self.coord.client_topic, "RLS": "0",
+                    "MEDIATYPE": 2, "VER": "1.0", "SYS": "3",
+                    "LEN": len(answer), "SID": now_sid(),
+                }, "BODY": {"SDP": answer}})
+                await rec.start()
+                _LOGGER.info("🎬 cloud recording started: %s", out)
+                await asyncio.sleep(14)
+            except Exception:
+                _LOGGER.exception("cloud recording setup failed")
+            finally:
+                try:
+                    await rec.stop()
+                except Exception:
+                    _LOGGER.warning("cloud recording mux finalisation failed", exc_info=True)
+                try:
+                    await pc.close()
+                except Exception:
+                    pass
+                if cid:
+                    self.coord.publish({"HEADER": {
+                        "MID": "30031", "CID": cid, "PROPID": self.coord.property_id,
+                        "CLIID": self.coord.cliid, "RSLT": 0,
+                        "RCVTPC": self.coord.client_topic, "RLS": "0",
+                        "VER": "1.0", "SYS": "3", "LEN": 0, "SID": now_sid(),
+                    }, "BODY": {}})
+            if out.exists() and out.stat().st_size > 1000:
+                _LOGGER.info("💾 cloud recording saved %s (%d B)", out, out.stat().st_size)
+                async_dispatcher_send(self.coord.hass, SIGNAL_CAMERA_REFRESH)
+                return out
+            return None
 
     async def aclose(self) -> None:
         """Coordinator shutdown — drop any in-flight capture cleanly."""

@@ -19,6 +19,7 @@ async def async_setup_entry(
     async_add_entities([
         AiphoneMonitorButton(coord),
         AiphoneAnswerButton(coord),
+        AiphoneFetchRecordingButton(coord),
     ])
 
 
@@ -54,3 +55,19 @@ class AiphoneAnswerButton(ButtonEntity):
 
     async def async_press(self) -> None:
         self._coord.async_answer_call()
+
+
+class AiphoneFetchRecordingButton(ButtonEntity):
+    """Download the most recent cloud recording for this call/unit."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Fetch last recording"
+    _attr_icon = "mdi:cloud-download"
+
+    def __init__(self, coordinator: AiphoneCoordinator) -> None:
+        self._coord = coordinator
+        self._attr_unique_id = f"{coordinator.device_id}_fetch_recording"
+        self._attr_device_info = _device_info(coordinator)
+
+    async def async_press(self) -> None:
+        await self._coord.async_fetch_recording()

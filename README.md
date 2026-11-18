@@ -72,6 +72,24 @@ entry. Treat your HA backup as sensitive.
 | `image.…_last_snapshot` | First frame of the last recording |
 | `button.…_monitor` | Active monitor capture (the station can take up to ~45 s to send its `30021` media offer) |
 | `button.…_answer` | Answer the ringing call |
+| `button.…_fetch_last_recording` | Download the latest cloud recording |
+
+## Cloud recordings
+
+The integration can download the cloud’s **video-only recording** of a call even when another phone app answered and took the live video slot.
+
+- **Automatic:** on `24003`/`24004` (call ended/cancelled) the coordinator waits 8 s and fetches the call’s RECID via `23041 → 30011 → 31011 → 30012`. It retries up to three times. The saved `cloud-<time>-<recid>.mp4` becomes the newest recording, so the camera/image/sensor update automatically.
+- **Manual:** `button.…_fetch_last_recording` or the service:
+
+```yaml
+service: aiphone_ixg.fetch_recording
+data:
+  rec_id: "3020-7e6d26f8f661af15-20261118182206418444"  # optional
+```
+
+Without `rec_id` it uses the most recent call CID. Clips are 640×480 H.264, video-only, around 10 s (the playback stream can occasionally end early).
+
+The live join now uses the app slot’s **Client topic** (`3020/Client/<CLIID>`) for `30011`/`30012`, which is required for the cloud to offer media. Live video still depends on the entrance station actually ringing/offering to this slot; if it does not, the cloud recording fetch above is the fallback.
 
 ## HA events
 
@@ -127,6 +145,7 @@ Assistant SDK / TTS notify service for announcements.
 - **Monitor needs a target station.** The last caller's `SRCNO` is remembered
   and persisted; ring the doorbell once after installing before pressing
   Monitor the first time.
+- **Live video requires the slot in the live call group.** Cloud recording fetch works independently and is automatic after each call.
 - Firmware/cloud changes can break the protocol. Use on equipment you own.
 
 ## Troubleshooting
